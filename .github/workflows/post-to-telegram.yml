@@ -1,0 +1,47 @@
+name: Post Report to Telegram
+
+on:
+  push:
+    paths:
+      - 'reports/**.md'
+    branches:
+      - main
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Find newest report
+        id: report
+        run: |
+          FILE=$(git diff-tree --no-commit-id --name-only -r HEAD -- 'reports/*.md' | head -n1)
+          if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+            FILE=$(ls -t reports/*.md 2>/dev/null | head -n1)
+          fi
+          if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+            echo "No report file found"; exit 0
+          fi
+          echo "file=$FILE" >> $GITHUB_OUTPUT
+          echo "date=$(basename "$FILE" .md)" >> $GITHUB_OUTPUT
+
+      - name: Send to Telegram
+        if: steps.report.outputs.file != ''
+        env:
+          TGBOT: ${{ secrets.TGBOT }}
+          TGCHAT: ${{ secrets.TGCHAT }}
+        run: |
+          FILE="${{ steps.report.outputs.file }}"
+          DATE="${{ steps.report.outputs.date }}"
+          # Send a short header
+          curl -s -X POST "https://api.telegram.org/bot${TGBOT}/sendMessage" \
+            -d "chat_id=${TGCHAT}" \
+            -d "text=Новая сводка скаута — ${DATE}. Полный отчёт ниже файлом."
+          # Send the .md file as document
+          curl -s -X POST "https://api.telegram.org/bot${TGBOT}/sendDocument" \
+            -F "chat_id=${TGCHAT}" \
+            -F "document=@${FILE}"
