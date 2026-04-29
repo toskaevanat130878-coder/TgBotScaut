@@ -6,6 +6,12 @@ on:
       - 'reports/**.md'
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      file:
+        description: 'Path to report file (e.g. reports/2026-04-29.md). Empty = newest.'
+        required: false
+        default: ''
 
 jobs:
   post:
@@ -16,32 +22,82 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Find newest report
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Find report file
         id: report
+        env:
+          INPUT_FILE: ${{ github.event.inputs.file }}
         run: |
-          FILE=$(git diff-tree --no-commit-id --name-only -r HEAD -- 'reports/*.md' | head -n1)
-          if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
-            FILE=$(ls -t reports/*.md 2>/dev/null | head -n1)
+          if [ -n "$INPUT_FILE" ]; then
+            FILE="$INPUT_FILE"
+          else
+            FILE=$(git diff-tree --no-commit-id --name-only -r HEAD -- 'reports/*.md' | head -n1)
+            if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+              FILE=$(ls -t reports/*.md 2>/dev/null | head -n1)
+            fi
           fi
           if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
-            echo "No report file found"; exit 0
+            echo "No report file found"; exit 1
           fi
           echo "file=$FILE" >> $GITHUB_OUTPUT
-          echo "date=$(basename "$FILE" .md)" >> $GITHUB_OUTPUT
 
-      - name: Send to Telegram
-        if: steps.report.outputs.file != ''
+      - name: Convert markdown and send to Telegram
         env:
           TGBOT: ${{ secrets.TGBOT }}
           TGCHAT: ${{ secrets.TGCHAT }}
+          REPORT_FILE: ${{ steps.report.outputs.file }}
         run: |
-          FILE="${{ steps.report.outputs.file }}"
-          DATE="${{ steps.report.outputs.date }}"
-          # Send a short header
-          curl -s -X POST "https://api.telegram.org/bot${TGBOT}/sendMessage" \
-            -d "chat_id=${TGCHAT}" \
-            -d "text=Новая сводка скаута — ${DATE}. Полный отчёт ниже файлом."
-          # Send the .md file as document
-          curl -s -X POST "https://api.telegram.org/bot${TGBOT}/sendDocument" \
-            -F "chat_id=${TGCHAT}" \
-            -F "document=@${FILE}"
+          python <<'PYEOF'
+          import os, re, sys, requests
+
+          path = os.environ['REPORT_FILE']
+          with open(path, 'r', encoding='utf-8') as f:
+              text = f.read()
+
+          text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+          text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+          text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+          text = re.sub(r'^### (.+)$', r'<b>▸ \1</b>', text, flags=re.MULTILINE)
+          text = re.sub(r'^## (.+)$', r'<b>━━ \1 ━━</b>', text, flags=re.MULTILINE)
+          text = re.sub(r'^# (.+)$', r'<b>📰 \1</b>', text, flags=re.MULTILINE)
+          text = re.sub(r'^- ', '• ', text, flags=re.MULTILINE)
+
+          MAX = 4000
+          chunks = []
+          while len(text) > MAX:
+              split = text.rfind('\n', 0, MAX)
+              if split == -1:
+                  split = MAX
+              chunks.append(text[:split])
+              text = text[split:].lstrip()
+          if text.strip():
+              chunks.append(text)
+
+          bot = os.environ['TGBOT']
+          chat = os.environ['TGCHAT']
+          total = len(chunks)
+
+          for i, chunk in enumerate(chunks, 1):
+              suffix = f"\n\n<i>({i}/{total})</i>" if total > 1 else ''
+              r = requests.post(
+                  f'https://api.telegram.org/bot{bot}/sendMessage',
+                  data={
+                      'chat_id': chat,
+                      'text': chunk + suffix,
+                      'parse_mode': 'HTML',
+                      'disable_web_page_preview': True,
+                  },
+                  timeout=20,
+              )
+              if r.status_code != 200:
+                  print(f'Chunk {i} failed: {r.status_code} {r.text}')
+                  sys.exit(1)
+              print(f'Chunk {i}/{total} sent ({len(chunk)} chars)')
+          PYEOF
